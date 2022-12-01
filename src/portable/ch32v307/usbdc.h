@@ -17,7 +17,7 @@
 */
 
 //#define USBDC_ENDPTN_MPS_MAX   ( 1024u )
-#define USBDC_ENDPTN_MPS_MAX   ( 64u )
+#define USBDC_ENDPTN_MPS_MAX   ( 512u )
 #define USBDC_ENDPT0_MPS_MAX   ( 64u )
 #define USBDC_ENDPTN_CNT       ( 16u )
 #define USBDC_ENDPTN_MAX       ( USBDC_ENDPTN_CNT - 1u )

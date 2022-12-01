@@ -1,4 +1,6 @@
 #include "usbdc.h"
+
+#include "ch32v30x_rcc.h"
 #include "ch32v30x_usbhs_device.h"
 
 #include <stdbool.h>
@@ -30,6 +32,8 @@
 
 #define MIN(a, b) (a < b ? a : b)
 
+static void *m_endpt0pData = NULL;
+static void *m_endptnpData[USBDC_ENDPTN_CNT][2] = { };
 static uint16_t m_endpt0Mps = 0u;
 static uint16_t m_endptnTxMps[USBDC_ENDPTN_CNT] = { 0 };
 static uint16_t m_endptnRxMps[USBDC_ENDPTN_CNT] = { 0 };
@@ -47,40 +51,47 @@ void usbdc_Init(void)
     /* Disable usbd controller */
     usbdc_Disable();
     /* Init clock */
-    USBHS_RCC_Init();
+    RCC_USBCLK48MConfig(RCC_USBCLK48MCLKSource_USBPHY);
+    RCC_USBHSPLLCLKConfig(RCC_HSBHSPLLCLKSource_HSE);
+    RCC_USBHSConfig(RCC_USBPLL_Div2);
+    RCC_USBHSPLLCKREFCLKConfig(RCC_USBHSPLLCKREFCLK_4M);
+    RCC_USBHSPHYPLLALIVEcmd(ENABLE);
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_USBHS, ENABLE);
     /* Multiplex GPIO */
     /* Init usbd controller */
-    REG_SET_VAL(USBHSD->HOST_CTRL, USBHS_SUSPENDM);
-    REG_SET_BITMASK(USBHSD->CONTROL, USBHS_DMA_EN);
-    REG_SET_BITMASK(USBHSD->CONTROL, USBHS_INT_BUSY_EN);
-    REG_SET_BITMASK(USBHSD->CONTROL, USBHS_FULL_SPEED);
-    REG_SET_VAL(USBHSD->INT_FG, 0xffu);
-    REG_SET_BITMASK(USBHSD->INT_EN, USBHS_SETUP_ACT_EN);
-    REG_SET_BITMASK(USBHSD->INT_EN, USBHS_TRANSFER_EN);
-    REG_SET_BITMASK(USBHSD->INT_EN, USBHS_DETECT_EN);
+    USBHSD->HOST_CTRL = 0u;
+    USBHSD->HOST_CTRL = USBHS_SUSPENDM;
+    USBHSD->CONTROL = 0u;
+    USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_HIGH_SPEED;
+    USBHSD->INT_FG = 0xffu;
+    USBHSD->INT_EN = 0u;
+    USBHSD->INT_EN |= USBHS_SETUP_ACT_EN;
+    USBHSD->INT_EN |= USBHS_TRANSFER_EN;
+    USBHSD->INT_EN |= USBHS_DETECT_EN;
+    USBHSD->INT_EN |= USBHS_SUSPEND_EN;
     /* Disable all endpoints */
-    REG_SET_VAL(USBHSD->ENDP_CONFIG, 0u);
-    REG_SET_VAL(USBHSD->ENDP_TYPE, 0u);
-    REG_SET_VAL(USBHSD->BUF_MODE, 0u);
+    USBHSD->ENDP_CONFIG = 0u;
+    USBHSD->ENDP_TYPE = 0u;
+    USBHSD->BUF_MODE = 0u;
 }
 
 /** */
 void usbdc_Enable(void)
 {
-    REG_SET_BITMASK(USBHSD->CONTROL, USBHS_DEV_PU_EN);
+    USBHSD->CONTROL |= USBHS_DEV_PU_EN;
 }
 
 /** */
 void usbdc_Disable(void)
 {
-    REG_CLR_BITMASK(USBHSD->CONTROL, USBHS_DEV_PU_EN);
+    USBHSD->CONTROL &= ~USBHS_DEV_PU_EN;
 }
 
 /** */
 void usbdc_SetAddress(
     uint8_t address)
 {
-    REG_SET_VAL(USBHSD->DEV_AD, address);
+    USBHSD->DEV_AD = address;
 }
 
 /** */
@@ -116,11 +127,14 @@ bool usbdc_EndptnTxConfig(
     if (!pDma)
         return false;
 
+    if (mps > USBHSD_MAX_LEN(epNum))
+        USBHSD_MAX_LEN(epNum) = mps;
     /* Configure to be synchronized transfer */
     uint32_t eptPosBitmask = 1u << epNum;
-    REG_SET_BITMASK(USBHSD->ENDP_CONFIG, eptPosBitmask);
+    USBHSD->ENDP_CONFIG |= eptPosBitmask;
     /* Set DMA address */
     USB_SET_TX_DMA(epNum, (uint32_t) pDma);
+    m_endptnpData[epNum][1] = pDma;
     /* Bookkeep mps */
     m_endptnTxMps[epNum] = mps;
 
@@ -140,11 +154,14 @@ bool usbdc_EndptnRxConfig(
     if (!pDma)
         return false;
 
+    if (mps > USBHSD_MAX_LEN(epNum))
+        USBHSD_MAX_LEN(epNum) = mps;
     /* Configure to be synchronized transfer */
     uint32_t eptPosBitmask = 1u << (epNum + 16u);
-    REG_SET_BITMASK(USBHSD->ENDP_CONFIG, eptPosBitmask);
+    USBHSD->ENDP_CONFIG |= eptPosBitmask;
     /* Set DMA address */
     USB_SET_RX_DMA(epNum, (uint32_t) pDma);
+    m_endptnpData[epNum][0] = pDma;
     /* Bookkeep mps */
     m_endptnRxMps[epNum] = mps;
 
@@ -156,9 +173,10 @@ bool usbdc_EndptnTxEnable(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-
+    USBHSD_TX_CTRL(epNum) &= USBHS_EP_T_TOG_MASK;
+    USBHSD_TX_CTRL(epNum) |= USBHS_EP_T_AUTOTOG;
     uint32_t eptPosBitmask = 1u << epNum;
-    REG_SET_BITMASK(USBHSD->ENDP_CONFIG, eptPosBitmask);
+    USBHSD->ENDP_CONFIG |= eptPosBitmask;
     return true;
 }
 
@@ -168,9 +186,10 @@ bool usbdc_EndptnRxEnable(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-
+    USBHSD_RX_CTRL(epNum) &= USBHS_EP_R_TOG_MASK;
+    USBHSD_RX_CTRL(epNum) |= USBHS_EP_R_AUTOTOG;
     uint32_t eptPosBitmask = 1u << (epNum + 16u);
-    REG_SET_BITMASK(USBHSD->ENDP_CONFIG, eptPosBitmask);
+    USBHSD->ENDP_CONFIG |= eptPosBitmask;
     return true;
 }
 
@@ -180,9 +199,10 @@ bool usbdc_EndptnTxDisable(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-
     uint32_t eptPosBitmask = 1u << epNum;
-    REG_CLR_BITMASK(USBHSD->ENDP_CONFIG, eptPosBitmask);
+    USBHSD->ENDP_CONFIG &= ~eptPosBitmask;
+    USBHSD_TX_LEN(epNum) = 0;
+    USB_SET_TX_DMA(epNum, (uint32_t) NULL);
     return true;
 }
 
@@ -192,9 +212,9 @@ bool usbdc_EndptnRxDisable(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-
     uint32_t eptPosBitmask = 1u << (epNum + 16u);
-    REG_CLR_BITMASK(USBHSD->ENDP_CONFIG, eptPosBitmask);
+    USBHSD->ENDP_CONFIG &= ~eptPosBitmask;
+    USB_SET_RX_DMA(epNum, (uint32_t) NULL);
     return true;
 }
 
@@ -207,15 +227,13 @@ bool usbdc_EndptnRead(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-    if (!pData)
+    if (!pData && nBytes > 0)
         return false;
-    if (!pReadBytes)
-        return false;
-
     uint32_t nToRead = MIN(USBHSD->RX_LEN, nBytes);
-    void *pDma = (void *) USBHSD_RX_DMA(epNum);
-    memcpy(pDma, pData, nToRead);
-    *pReadBytes = nToRead;
+    if (pData)
+        memcpy(pData, m_endptnpData[epNum][0], nToRead);
+    if (pReadBytes)
+        *pReadBytes = nToRead;
     return true;
 }
 
@@ -228,16 +246,14 @@ bool usbdc_EndptnWrite(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-    if (!pData)
+    if (!pData && nBytes > 0u)
         return false;
-    if (!pWriteBytes)
-        return false;
-
     uint32_t nToSend = MIN(m_endptnTxMps[epNum], nBytes);
-    void *pDma = (void *) USBHSD_TX_DMA(epNum);
-    memcpy(pData, pDma, nToSend);
+    if (pData)
+        memcpy(m_endptnpData[epNum][1], pData, nToSend);
     USBHSD_TX_LEN(epNum) = nToSend;
-    *pWriteBytes = nToSend;
+    if (pWriteBytes)
+        *pWriteBytes = nToSend;
     return true;
 }
 
@@ -250,7 +266,7 @@ bool usbdc_EndptnTxLen(
         return false;
     if (!pTxLen)
         return false;
-    *pTxLen = USBHSD_TX_LEN(0u);
+    *pTxLen = USBHSD_TX_LEN(epNum);
     return true;
 }
 
@@ -273,7 +289,8 @@ bool usbdc_EndptnTxSetData0(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-    REG_SET_BITFIELD(USBHSD_TX_CTRL(epNum), USBHS_EP_T_TOG_MASK, USBHS_EP_T_TOG_0);
+    USBHSD_TX_CTRL(epNum) &= ~USBHS_EP_T_TOG_MASK;
+    USBHSD_TX_CTRL(epNum) |= USBHS_EP_T_TOG_0;
     return true;
 }
 
@@ -283,7 +300,8 @@ bool usbdc_EndptnRxSetData0(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-    REG_SET_BITFIELD(USBHSD_RX_CTRL(epNum), USBHS_EP_R_TOG_MASK, USBHS_EP_R_TOG_0);
+    USBHSD_RX_CTRL(epNum) &= ~USBHS_EP_R_TOG_MASK;
+    USBHSD_RX_CTRL(epNum) |= USBHS_EP_R_TOG_0;
     return true;
 }
 
@@ -321,9 +339,9 @@ bool usbdc_EndptnTxReportStatus(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-
     uint32_t res = endptStatus2TxRes(status);
-    REG_SET_BITFIELD(USBHSD_TX_CTRL(epNum), USBHS_EP_T_RES_MASK, res);
+    USBHSD_TX_CTRL(epNum) &= ~USBHS_EP_T_RES_MASK;
+    USBHSD_TX_CTRL(epNum) |= res;
     return true;
 }
 
@@ -334,9 +352,9 @@ bool usbdc_EndptnRxReportStatus(
 {
     if (epNum == 0 || epNum > USBDC_ENDPTN_MAX)
         return false;
-
     uint32_t res = endptStatus2RxRes(status);
-    REG_SET_BITFIELD(USBHSD_RX_CTRL(epNum), USBHS_EP_R_RES_MASK, res);
+    USBHSD_RX_CTRL(epNum) &= ~USBHS_EP_R_RES_MASK;
+    USBHSD_RX_CTRL(epNum) |= res;
     return true;
 }
 
@@ -349,8 +367,9 @@ bool usbdc_Endpt0Config(
         return false;
     if (!pDma)
         return false;
-
-    REG_SET_VAL(USBHSD->UEP0_DMA, (uint32_t) pDma);
+    m_endpt0pData = pDma;
+    USBHSD->UEP0_DMA = (uint32_t) pDma;
+    USBHSD->UEP0_MAX_LEN = mps;
     m_endpt0Mps = mps;
     return true;
 }
@@ -361,11 +380,11 @@ bool usbdc_Endpt0Read(
     uint32_t nBytes,
     uint32_t *pReadBytes)
 {
-    if (!pData)
+    if (!pData && nBytes == 0u)
         return false;
     uint32_t nToRead = MIN(USBHSD->RX_LEN, nBytes);
-    void *pDma = (void *) USBHSD->UEP0_DMA;
-    memcpy(pDma, pData, nToRead);
+    if (pData)
+        memcpy(pData, m_endpt0pData, nToRead);
     if (pReadBytes)
         *pReadBytes = nToRead;
     return true;
@@ -377,11 +396,11 @@ bool usbdc_Endpt0Write(
     uint32_t nBytes,
     uint32_t *pWriteBytes)
 {
-    if (!pData)
+    if (!pData && nBytes > 0u)
         return false;
     uint32_t nToSend = MIN(m_endpt0Mps, nBytes);
-    void *pDma = (void *) USBHSD->UEP0_DMA;
-    memcpy(pDma, pData, nToSend);
+    if (pData)
+        memcpy(m_endpt0pData, pData, nToSend);
     USBHSD_TX_LEN(0u) = nToSend;
     if (pWriteBytes)
         *pWriteBytes = nToSend;
@@ -403,13 +422,15 @@ uint32_t usbdc_Endpt0RxLen(void)
 /** */
 void usbdc_Endpt0TxSetData0(void)
 {
-    REG_SET_BITFIELD(USB_GET_TX_CTRL(0u), USBHS_EP_T_TOG_MASK, USBHS_EP_T_TOG_0);
+    USB_GET_TX_CTRL(0u) &= ~USBHS_EP_T_TOG_MASK;
+    USB_GET_TX_CTRL(0u) |= USBHS_EP_T_TOG_0;
 }
 
 /** */
 void usbdc_Endpt0RxSetData0(void)
 {
-    REG_SET_BITFIELD(USBHSD_RX_CTRL(0u), USBHS_EP_R_TOG_MASK, USBHS_EP_R_TOG_0);
+    USBHSD_RX_CTRL(0u) &= ~USBHS_EP_R_TOG_MASK;
+    USBHSD_RX_CTRL(0u) |= USBHS_EP_R_TOG_0;
 }
 
 /** */
@@ -418,7 +439,8 @@ void usbdc_Endpt0TxToggleDatax(void)
     uint32_t reg = USBHSD_TX_CTRL(0u);
     uint32_t tog = reg & USBHS_EP_T_TOG_MASK;
     tog = (tog == USBHS_EP_T_TOG_0) ? USBHS_EP_T_TOG_1 : USBHS_EP_T_TOG_0;
-    REG_SET_BITFIELD(USB_GET_TX_CTRL(0u), USBHS_EP_T_TOG_MASK, tog);
+    USBHSD_TX_CTRL(0u) &= ~USBHS_EP_T_TOG_MASK;
+    USBHSD_TX_CTRL(0u) |= tog;
 }
 
 /** */
@@ -427,7 +449,8 @@ void usbdc_Endpt0RxToggleDatax(void)
     uint32_t reg = USBHSD_RX_CTRL(0u);
     uint32_t tog = reg & USBHS_EP_R_TOG_MASK;
     tog = (tog == USBHS_EP_R_TOG_0) ? USBHS_EP_R_TOG_1 : USBHS_EP_R_TOG_0;
-    REG_SET_BITFIELD(USBHSD_RX_CTRL(0u), USBHS_EP_R_TOG_MASK, tog);
+    USBHSD_RX_CTRL(0u) &= ~USBHS_EP_R_TOG_MASK;
+    USBHSD_RX_CTRL(0u) |= tog;
 }
 
 /** */
@@ -435,14 +458,16 @@ void usbdc_Endpt0TxReportStatus(
     usbdc_tEndptnStatus status)
 {
     uint32_t res = endptStatus2TxRes(status);
-    REG_SET_BITFIELD(USBHSD_TX_CTRL(0u), USBHS_EP_T_RES_MASK, res);
+    USBHSD_TX_CTRL(0u) &= ~USBHS_EP_T_RES_MASK;
+    USBHSD_TX_CTRL(0u) |= res;
 }
 /** */
 void usbdc_Endpt0RxReportStatus(
     usbdc_tEndptnStatus status)
 {
     uint32_t res = endptStatus2RxRes(status);
-    REG_SET_BITFIELD(USBHSD_RX_CTRL(0u), USBHS_EP_R_RES_MASK, res);
+    USBHSD_RX_CTRL(0u) &= ~USBHS_EP_R_RES_MASK;
+    USBHSD_RX_CTRL(0u) |= res;
 }
 
 /** */
